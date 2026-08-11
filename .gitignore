@@ -1,0 +1,23 @@
+# Залежності
+node_modules/
+
+# Змінні середовища (містять токени та секрети)
+.env
+.env.*
+!.env.example
+
+# Логи
+logs/
+*.log
+npm-debug.log*
+
+# PM2
+.pm2/
+
+# Операційна система
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
