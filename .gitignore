@@ -6,6 +6,11 @@ node_modules/
 .env.*
 !.env.example
 
+# Дані з реальною персональною перепискою клієнтів та FAQ-базою
+data/*.jsonl
+data/*.json
+!data/.gitkeep
+
 # Логи
 logs/
 *.log
