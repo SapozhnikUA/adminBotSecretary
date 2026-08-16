@@ -144,12 +144,16 @@ const lastReplyMap = new Map(); // userId -> timestamp останньої заг
 
 // ---- Бізнес-повідомлення (Автоматизація чатів / Secretary mode) ----
 
-bot.on('business_message', async (ctx) => {
-  try {
-    await handleBusinessMessage(ctx);
-  } catch (err) {
+// ВАЖЛИВО: обробник НЕ await'иться тут — Telegraf у режимі polling чекає завершення
+// обробника поточного апдейту, перш ніж забрати наступний. Якщо чекати тут (await),
+// довгий AI-запит (до 45с) блокує весь бот: кнопки в /settings, інші команди й
+// повідомлення просто не дійдуть вчасно (Telegram визнає їх "застарілими").
+// Тому запускаємо обробку у фоні ("fire-and-forget"), а Telegraf одразу йде за
+// наступним апдейтом.
+bot.on('business_message', (ctx) => {
+  handleBusinessMessage(ctx).catch((err) => {
     console.error('[business_message] Необроблена помилка:', err);
-  }
+  });
 });
 
 async function handleBusinessMessage(ctx) {
@@ -213,7 +217,19 @@ async function handleBusinessMessage(ctx) {
       }
     };
 
-    // ---- Канал 1: AI-класифікатор (FAQ) — без cooldown, окреме повідомлення ----
+    // ---- Канал 1: фіксована заглушка за годиною — миттєво, з cooldown ----
+    if (toggles.fixedEnabled) {
+      const lastReply = lastReplyMap.get(userId);
+      const cooldownMs = autoReplyConfig.cooldownMs || 3600000;
+      if (!lastReply || now - lastReply >= cooldownMs) {
+        lastReplyMap.set(userId, now);
+        await sendReply(getAutoReplyText(autoReplyConfig), 'fixed');
+      } else {
+        console.log(`[cooldown] Заглушку для ${userId} пропущено (ще діє cooldown)`);
+      }
+    }
+
+    // ---- Канал 2: AI-класифікатор (FAQ) — з затримкою (думає), без cooldown ----
     if (toggles.llmEnabled && messageText) {
       const { systemPrompt, faqList } = buildClassifierPrompt(ollamaConfig.baseSystemPrompt);
 
@@ -238,18 +254,6 @@ async function handleBusinessMessage(ctx) {
         console.log(`[ollama] Збігу з FAQ не знайдено для ${userId}`);
       }
     }
-
-    // ---- Канал 2: фіксована заглушка за годиною — публікується безумовно, з cooldown ----
-    if (toggles.fixedEnabled) {
-      const lastReply = lastReplyMap.get(userId);
-      const cooldownMs = autoReplyConfig.cooldownMs || 3600000;
-      if (!lastReply || now - lastReply >= cooldownMs) {
-        lastReplyMap.set(userId, now);
-        await sendReply(getAutoReplyText(autoReplyConfig), 'fixed');
-      } else {
-        console.log(`[cooldown] Заглушку для ${userId} пропущено (ще діє cooldown)`);
-      }
-    }
   } finally {
     inFlightUsers.delete(userId);
   }
@@ -271,8 +275,8 @@ bot.action('toggle_fixed', async (ctx) => {
   toggles.fixedEnabled = !toggles.fixedEnabled;
   saveToggles();
   console.log(`[settings] Фіксована заглушка ${toggles.fixedEnabled ? 'увімкнена' : 'вимкнена'} через /settings`);
-  await ctx.editMessageText(settingsText(), { parse_mode: 'HTML', ...settingsKeyboard() });
   await ctx.answerCbQuery(toggles.fixedEnabled ? 'Увімкнено' : 'Вимкнено');
+  await ctx.editMessageText(settingsText(), { parse_mode: 'HTML', ...settingsKeyboard() });
 });
 
 bot.action('toggle_llm', async (ctx) => {
@@ -280,8 +284,8 @@ bot.action('toggle_llm', async (ctx) => {
   toggles.llmEnabled = !toggles.llmEnabled;
   saveToggles();
   console.log(`[settings] AI-відповіді ${toggles.llmEnabled ? 'увімкнені' : 'вимкнені'} через /settings`);
-  await ctx.editMessageText(settingsText(), { parse_mode: 'HTML', ...settingsKeyboard() });
   await ctx.answerCbQuery(toggles.llmEnabled ? 'Увімкнено' : 'Вимкнено');
+  await ctx.editMessageText(settingsText(), { parse_mode: 'HTML', ...settingsKeyboard() });
 });
 
 bot.command('pending', async (ctx) => {
@@ -319,17 +323,23 @@ bot.hears(/^\/reject_([a-f0-9]{8})$/, async (ctx) => {
   }
 });
 
-bot.command('analyze_now', async (ctx) => {
+// Так само як для business_message: не await'имо аналіз всередині обробника
+// команди, щоб довгий AI-аналіз (до кількох хвилин) не блокував Telegraf
+// від забору наступних апдейтів (кнопки, інші команди).
+bot.command('analyze_now', (ctx) => {
   if (!isAdmin(ctx)) return;
-  await ctx.reply('Запускаю аналіз логу за останню добу...');
-  const added = await runAnalysisGuarded('analyze_now');
-  if (added === null) {
-    return ctx.reply('Аналіз вже виконується у фоні, зачекай на завершення.');
-  }
-  if (added.length === 0) {
-    return ctx.reply('Нових типових питань не знайдено.');
-  }
-  await ctx.reply(`Знайдено ${added.length} нових кандидатів. Перевір /pending`);
+  ctx.reply('Запускаю аналіз логу за останню добу...').catch(() => {});
+
+  (async () => {
+    const added = await runAnalysisGuarded('analyze_now');
+    if (added === null) {
+      return ctx.reply('Аналіз вже виконується у фоні, зачекай на завершення.');
+    }
+    if (added.length === 0) {
+      return ctx.reply('Нових типових питань не знайдено.');
+    }
+    await ctx.reply(`Знайдено ${added.length} нових кандидатів. Перевір /pending`);
+  })().catch((err) => console.error('[analyze_now] Необроблена помилка:', err));
 });
 
 // ---- Щоденний cron-аналіз ----
