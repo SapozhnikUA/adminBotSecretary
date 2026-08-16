@@ -4,8 +4,8 @@ const path = require('path');
 const cron = require('node-cron');
 const { Telegraf } = require('telegraf');
 
-const { askOllama } = require('./lib/ollama');
-const { buildSystemPrompt, loadPending, approveCandidate, rejectCandidate } = require('./lib/faq');
+const { classifyMessage } = require('./lib/ollama');
+const { buildClassifierPrompt, loadPending, approveCandidate, rejectCandidate } = require('./lib/faq');
 const { getAutoReplyText } = require('./lib/autoReply');
 const { logMessage } = require('./lib/conversationLogger');
 const { runDailyFaqAnalysis } = require('./cron/dailyFaqAnalysis');
@@ -28,7 +28,7 @@ if (!ADMIN_ID) {
 }
 
 const bot = new Telegraf(process.env.BOT_TOKEN, {
-  handlerTimeout: 300_000, // 5 хвилин — щоб довгі AI-аналізи не обривались
+  handlerTimeout: 300_000, // 5 хвилин — щоб довгі AI-запити не обривались Telegraf'ом
 });
 
 const AUTO_REPLY_CONFIG_PATH = path.join(__dirname, 'config', 'auto-reply-config.json');
@@ -59,30 +59,6 @@ function loadJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
 }
 
-// Імітація набору тексту: sendChatAction("typing") тримається на боці Telegram
-// ~5 секунд, тому для довших пауз його треба надсилати повторно.
-async function simulateTyping(ctx, chatId, businessConnectionId, textLength) {
-  const msPerChar = 35; // приблизна "швидкість друку"
-  const minDelay = 800;
-  const maxDelay = 6000; // не тримати людину занадто довго
-  const delay = Math.min(Math.max(textLength * msPerChar, minDelay), maxDelay);
-
-  const extra = businessConnectionId ? { business_connection_id: businessConnectionId } : {};
-
-  let elapsed = 0;
-  while (elapsed < delay) {
-    try {
-      await ctx.telegram.sendChatAction(chatId, 'typing', extra);
-    } catch (err) {
-      console.error('Помилка sendChatAction:', err.message);
-      break;
-    }
-    const step = Math.min(4000, delay - elapsed); // typing "живе" ~5с, оновлюємо з запасом
-    await new Promise((resolve) => setTimeout(resolve, step));
-    elapsed += step;
-  }
-}
-
 let analysisInProgress = false;
 
 async function runAnalysisGuarded(label) {
@@ -98,11 +74,36 @@ async function runAnalysisGuarded(label) {
   }
 }
 
+// Глобальна черга звернень до Ollama. Ollama на CPU обробляє генерацію
+// послідовно, тому кілька паралельних запитів лише сповільнюють одне одного
+// і призводять до таймаутів. Ця черга гарантує, що в кожен момент часу
+// до Ollama йде не більше одного chat-запиту — решта чекають своєї черги тут,
+// на боці Node.js, де це видно й контрольовано, а не мовчки всередині Ollama.
+let ollamaQueue = Promise.resolve();
+function queueOllamaCall(fn) {
+  const run = ollamaQueue.then(fn, fn);
+  ollamaQueue = run.catch(() => {}); // помилка одного запиту не має ламати чергу для наступних
+  return run;
+}
+
+// Захист від дублів: якщо від того самого користувача вже обробляється
+// повідомлення (він написав кілька разів поспіль, не дочекавшись відповіді),
+// нові повідомлення не запускають додаткові паралельні AI-запити.
+const inFlightUsers = new Set();
+
 const lastReplyMap = new Map(); // userId -> timestamp останньої заглушки-fallback
 
 // ---- Бізнес-повідомлення (Автоматизація чатів / Secretary mode) ----
 
 bot.on('business_message', async (ctx) => {
+  try {
+    await handleBusinessMessage(ctx);
+  } catch (err) {
+    console.error('[business_message] Необроблена помилка:', err);
+  }
+});
+
+async function handleBusinessMessage(ctx) {
   const msg = ctx.update.business_message;
   const chat = msg.chat;
   const from = msg.from;
@@ -134,46 +135,69 @@ bot.on('business_message', async (ctx) => {
     return;
   }
 
-  const systemPrompt = buildSystemPrompt(ollamaConfig.baseSystemPrompt);
-
-  const aiResult = messageText
-    ? await askOllama({ config: ollamaConfig, systemPrompt, userText: messageText })
-    : null;
-
-  let replyText = null;
-
-  if (aiResult && aiResult.confident && aiResult.answer.trim()) {
-    replyText = aiResult.answer.trim() + (ollamaConfig.aiDisclaimer || '');
-    console.log(`[ollama] Впевнена відповідь для ${userId}`);
-  } else {
-    const lastReply = lastReplyMap.get(userId);
-    const cooldownMs = autoReplyConfig.cooldownMs || 3600000;
-    if (!lastReply || now - lastReply >= cooldownMs) {
-      replyText = getAutoReplyText(autoReplyConfig);
-      lastReplyMap.set(userId, now);
-      console.log(`[fallback] Стандартна заглушка для ${userId}`);
-    }
+  // Користувач уже написав раніше і те повідомлення ще обробляється (AI не відповіла) —
+  // не запускаємо другий паралельний запит до Ollama, просто ігноруємо дубль.
+  if (inFlightUsers.has(userId)) {
+    console.log(`[skip] Повідомлення від ${userId} вже обробляється, пропускаю дубль`);
+    return;
   }
+  inFlightUsers.add(userId);
 
-  if (replyText) {
-    try {
-      await simulateTyping(ctx, chat.id, msg.business_connection_id, replyText.length);
-      await ctx.telegram.sendMessage(chat.id, replyText, {
-        business_connection_id: msg.business_connection_id,
-      });
-      // Відповідь самого бота теж варто залогувати, щоб вона враховувалась в аналізі
-      await logMessage({
-        chatId: chat.id,
-        peerId: chat.id,
-        role: 'admin',
-        text: replyText,
-        timestamp: Date.now(),
-      });
-    } catch (err) {
-      console.error('Помилка відправки відповіді:', err);
+  try {
+    const { systemPrompt, faqList } = buildClassifierPrompt(ollamaConfig.baseSystemPrompt);
+
+    const startedAt = Date.now();
+    const matchedId = messageText
+      ? await queueOllamaCall(() => classifyMessage({ config: ollamaConfig, systemPrompt, userText: messageText }))
+      : null;
+    console.log(`[ollama] Запит для ${userId} зайняв ${Date.now() - startedAt}мс, matchedId=${matchedId}`);
+
+    // matchedId — це номер (1-based) зі списку, показаного моделі. Текст відповіді
+    // береться напряму з faqList, без жодної генерації — так URL/форматування
+    // не можуть бути спотворені чи "загублені" моделлю.
+    const matchedEntry =
+      Number.isInteger(matchedId) && matchedId >= 1 && matchedId <= faqList.length
+        ? faqList[matchedId - 1]
+        : null;
+
+    let replyText = null;
+
+    if (matchedEntry) {
+      replyText = matchedEntry.answer.trim() + (ollamaConfig.aiDisclaimer || '');
+      console.log(`[ollama] Знайдено відповідність FAQ #${matchedId} для ${userId}: "${matchedEntry.question}"`);
+    } else {
+      const lastReply = lastReplyMap.get(userId);
+      const cooldownMs = autoReplyConfig.cooldownMs || 3600000;
+      if (!lastReply || now - lastReply >= cooldownMs) {
+        replyText = getAutoReplyText(autoReplyConfig);
+        lastReplyMap.set(userId, now);
+        console.log(`[fallback] Стандартна заглушка для ${userId}`);
+      } else {
+        console.log(`[cooldown] Заглушку для ${userId} пропущено (ще діє cooldown)`);
+      }
     }
+
+    if (replyText) {
+      try {
+        await ctx.telegram.sendMessage(chat.id, replyText, {
+          business_connection_id: msg.business_connection_id,
+        });
+        // Відповідь самого бота теж варто залогувати, щоб вона враховувалась в аналізі
+        await logMessage({
+          chatId: chat.id,
+          peerId: chat.id,
+          role: 'admin',
+          text: replyText,
+          timestamp: Date.now(),
+        });
+      } catch (err) {
+        console.error('Помилка відправки відповіді:', err);
+      }
+    }
+  } finally {
+    inFlightUsers.delete(userId);
   }
-});
+}
 
 // ---- Адмін-команди (звичайні повідомлення боту напряму, не бізнес-режим) ----
 
@@ -235,9 +259,10 @@ cron.schedule(
   CRON_SCHEDULE,
   async () => {
     console.log('[cron] Запуск щоденного аналізу FAQ...');
-    const added = await runAnalysisGuarded('analyze_now');
+    const added = await runAnalysisGuarded('cron');
     if (added === null) {
-      return ctx.reply('Аналіз вже виконується у фоні, зачекай на завершення.');
+      // Аналіз вже виконувався паралельно (наприклад, через /analyze_now) — просто пропускаємо
+      return;
     }
     if (added.length > 0 && NOTIFY_ADMIN && ADMIN_ID) {
       try {
