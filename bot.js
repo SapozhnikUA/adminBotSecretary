@@ -2,7 +2,7 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const cron = require('node-cron');
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 
 const { classifyMessage } = require('./lib/ollama');
 const { buildClassifierPrompt, loadPending, approveCandidate, rejectCandidate } = require('./lib/faq');
@@ -17,7 +17,6 @@ const ADMIN_IDS = (process.env.ADMIN_TELEGRAM_IDS || process.env.ADMIN_TELEGRAM_
 const ADMIN_ID = ADMIN_IDS[0]; // основний — куди шле сповіщення cron
 const NOTIFY_ADMIN = process.env.NOTIFY_ADMIN_ON_NEW_CANDIDATES !== 'false';
 const CRON_SCHEDULE = process.env.DAILY_ANALYSIS_CRON || '50 23 * * *';
-const AUTO_REPLY_ENABLED = process.env.AUTO_REPLY_ENABLED !== 'false';
 
 if (!process.env.BOT_TOKEN) {
   console.error('BOT_TOKEN не заданий у .env');
@@ -57,6 +56,56 @@ fs.watchFile(OLLAMA_CONFIG_PATH, () => {
 
 function loadJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+}
+
+// ---- Перемикачі автовідповіді (керовані з /settings, переживають pm2 restart) ----
+
+const TOGGLES_PATH = path.join(__dirname, 'config', 'runtime-toggles.json');
+
+function loadToggles() {
+  try {
+    return loadJson(TOGGLES_PATH);
+  } catch (err) {
+    // Файлу ще немає — стартові значення беремо з .env, далі керуємо тільки через бота
+    const initial = {
+      fixedEnabled: process.env.AUTO_REPLY_FIXED_ENABLED === 'true',
+      llmEnabled: process.env.AUTO_REPLY_LLM_ENABLED === 'true',
+    };
+    fs.writeFileSync(TOGGLES_PATH, JSON.stringify(initial, null, 2), 'utf-8');
+    return initial;
+  }
+}
+
+const toggles = loadToggles();
+
+function saveToggles() {
+  fs.writeFileSync(TOGGLES_PATH, JSON.stringify(toggles, null, 2), 'utf-8');
+}
+
+function settingsText() {
+  return (
+    `⚙️ <b>Налаштування автовідповіді</b>\n\n` +
+    `${toggles.fixedEnabled ? '🟢' : '🔴'} Фіксована заглушка: <b>${toggles.fixedEnabled ? 'увімкнена' : 'вимкнена'}</b>\n` +
+    `${toggles.llmEnabled ? '🟢' : '🔴'} AI-відповіді (FAQ): <b>${toggles.llmEnabled ? 'увімкнені' : 'вимкнені'}</b>\n\n` +
+    `Натисни кнопку, щоб перемкнути:`
+  );
+}
+
+function settingsKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback(
+        `${toggles.fixedEnabled ? '🔴 Вимкнути' : '🟢 Увімкнути'} фіксовану заглушку`,
+        'toggle_fixed'
+      ),
+    ],
+    [
+      Markup.button.callback(
+        `${toggles.llmEnabled ? '🔴 Вимкнути' : '🟢 Увімкнути'} AI-відповіді`,
+        'toggle_llm'
+      ),
+    ],
+  ]);
 }
 
 let analysisInProgress = false;
@@ -129,9 +178,9 @@ async function handleBusinessMessage(ctx) {
   const userId = from.id;
   console.log(`[business] Повідомлення від ${userId}: "${messageText}"`);
 
-  // Автовідповідач вимкнено через .env — лог вже записано вище, просто виходимо
-  if (!AUTO_REPLY_ENABLED) {
-    console.log(`[disabled] Автовідповідач вимкнено, відповідь не надсилається`);
+  // Жоден з каналів автовідповіді не активний — просто логуємо (вже зроблено вище) і виходимо
+  if (!toggles.fixedEnabled && !toggles.llmEnabled) {
+    console.log(`[disabled] Обидва автовідповідачі вимкнено, лише логування`);
     return;
   }
 
@@ -144,54 +193,61 @@ async function handleBusinessMessage(ctx) {
   inFlightUsers.add(userId);
 
   try {
-    const { systemPrompt, faqList } = buildClassifierPrompt(ollamaConfig.baseSystemPrompt);
-
-    const startedAt = Date.now();
-    const matchedId = messageText
-      ? await queueOllamaCall(() => classifyMessage({ config: ollamaConfig, systemPrompt, userText: messageText }))
-      : null;
-    console.log(`[ollama] Запит для ${userId} зайняв ${Date.now() - startedAt}мс, matchedId=${matchedId}`);
-
-    // matchedId — це номер (1-based) зі списку, показаного моделі. Текст відповіді
-    // береться напряму з faqList, без жодної генерації — так URL/форматування
-    // не можуть бути спотворені чи "загублені" моделлю.
-    const matchedEntry =
-      Number.isInteger(matchedId) && matchedId >= 1 && matchedId <= faqList.length
-        ? faqList[matchedId - 1]
-        : null;
-
-    let replyText = null;
-
-    if (matchedEntry) {
-      replyText = matchedEntry.answer.trim() + (ollamaConfig.aiDisclaimer || '');
-      console.log(`[ollama] Знайдено відповідність FAQ #${matchedId} для ${userId}: "${matchedEntry.question}"`);
-    } else {
-      const lastReply = lastReplyMap.get(userId);
-      const cooldownMs = autoReplyConfig.cooldownMs || 3600000;
-      if (!lastReply || now - lastReply >= cooldownMs) {
-        replyText = getAutoReplyText(autoReplyConfig);
-        lastReplyMap.set(userId, now);
-        console.log(`[fallback] Стандартна заглушка для ${userId}`);
-      } else {
-        console.log(`[cooldown] Заглушку для ${userId} пропущено (ще діє cooldown)`);
-      }
-    }
-
-    if (replyText) {
+    // Допоміжна функція відправки одного повідомлення-відповіді + його логування
+    const sendReply = async (text, sourceLabel) => {
       try {
-        await ctx.telegram.sendMessage(chat.id, replyText, {
+        await ctx.telegram.sendMessage(chat.id, text, {
           business_connection_id: msg.business_connection_id,
+          parse_mode: 'HTML',
         });
-        // Відповідь самого бота теж варто залогувати, щоб вона враховувалась в аналізі
         await logMessage({
           chatId: chat.id,
           peerId: chat.id,
           role: 'admin',
-          text: replyText,
+          text,
           timestamp: Date.now(),
         });
+        console.log(`[${sourceLabel}] Відповідь надіслана для ${userId}`);
       } catch (err) {
-        console.error('Помилка відправки відповіді:', err);
+        console.error(`Помилка відправки відповіді (${sourceLabel}):`, err);
+      }
+    };
+
+    // ---- Канал 1: AI-класифікатор (FAQ) — без cooldown, окреме повідомлення ----
+    if (toggles.llmEnabled && messageText) {
+      const { systemPrompt, faqList } = buildClassifierPrompt(ollamaConfig.baseSystemPrompt);
+
+      const startedAt = Date.now();
+      const matchedId = await queueOllamaCall(() =>
+        classifyMessage({ config: ollamaConfig, systemPrompt, userText: messageText })
+      );
+      console.log(`[ollama] Запит для ${userId} зайняв ${Date.now() - startedAt}мс, matchedId=${matchedId}`);
+
+      // matchedId — це номер (1-based) зі списку, показаного моделі. Текст відповіді
+      // береться напряму з faqList, без жодної генерації — так URL/форматування
+      // не можуть бути спотворені чи "загублені" моделлю.
+      const matchedEntry =
+        Number.isInteger(matchedId) && matchedId >= 1 && matchedId <= faqList.length
+          ? faqList[matchedId - 1]
+          : null;
+
+      if (matchedEntry) {
+        console.log(`[ollama] Знайдено відповідність FAQ #${matchedId} для ${userId}: "${matchedEntry.question}"`);
+        await sendReply(matchedEntry.answer.trim() + (ollamaConfig.aiDisclaimer || ''), 'ollama');
+      } else {
+        console.log(`[ollama] Збігу з FAQ не знайдено для ${userId}`);
+      }
+    }
+
+    // ---- Канал 2: фіксована заглушка за годиною — публікується безумовно, з cooldown ----
+    if (toggles.fixedEnabled) {
+      const lastReply = lastReplyMap.get(userId);
+      const cooldownMs = autoReplyConfig.cooldownMs || 3600000;
+      if (!lastReply || now - lastReply >= cooldownMs) {
+        lastReplyMap.set(userId, now);
+        await sendReply(getAutoReplyText(autoReplyConfig), 'fixed');
+      } else {
+        console.log(`[cooldown] Заглушку для ${userId} пропущено (ще діє cooldown)`);
       }
     }
   } finally {
@@ -204,6 +260,29 @@ async function handleBusinessMessage(ctx) {
 function isAdmin(ctx) {
   return ctx.from && ADMIN_IDS.includes(ctx.from.id);
 }
+
+bot.command('settings', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  await ctx.reply(settingsText(), { parse_mode: 'HTML', ...settingsKeyboard() });
+});
+
+bot.action('toggle_fixed', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  toggles.fixedEnabled = !toggles.fixedEnabled;
+  saveToggles();
+  console.log(`[settings] Фіксована заглушка ${toggles.fixedEnabled ? 'увімкнена' : 'вимкнена'} через /settings`);
+  await ctx.editMessageText(settingsText(), { parse_mode: 'HTML', ...settingsKeyboard() });
+  await ctx.answerCbQuery(toggles.fixedEnabled ? 'Увімкнено' : 'Вимкнено');
+});
+
+bot.action('toggle_llm', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery();
+  toggles.llmEnabled = !toggles.llmEnabled;
+  saveToggles();
+  console.log(`[settings] AI-відповіді ${toggles.llmEnabled ? 'увімкнені' : 'вимкнені'} через /settings`);
+  await ctx.editMessageText(settingsText(), { parse_mode: 'HTML', ...settingsKeyboard() });
+  await ctx.answerCbQuery(toggles.llmEnabled ? 'Увімкнено' : 'Вимкнено');
+});
 
 bot.command('pending', async (ctx) => {
   if (!isAdmin(ctx)) return;
@@ -283,6 +362,7 @@ cron.schedule(
 bot.launch({
   allowedUpdates: [
     'message',
+    'callback_query',
     'business_connection',
     'business_message',
     'edited_business_message',
